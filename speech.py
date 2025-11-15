@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import contextlib
+import copy
 import gc
 import os
 import queue
@@ -33,6 +34,45 @@ async def lifespan(app):
 app = OpenAIStub(lifespan=lifespan)
 xtts = None
 args = None
+
+
+class HotReloadingYAML:
+    """Cache YAML files in memory while still allowing on-disk edits."""
+
+    def __init__(self, path: str, empty_factory=list):
+        self.path = path
+        self.empty_factory = empty_factory
+        self._cached_mtime = None
+        self._data = None
+        self._lock = threading.Lock()
+
+    def _load(self):
+        default_exists(self.path)
+        try:
+            mtime = os.path.getmtime(self.path)
+        except FileNotFoundError:
+            # default_exists should prevent this, but guard anyway
+            logger.error(f"Unable to read {self.path}")
+            raise
+
+        if self._data is None or self._cached_mtime != mtime:
+            with self._lock:
+                # re-check inside the lock to avoid redundant reloads
+                mtime = os.path.getmtime(self.path)
+                if self._data is None or self._cached_mtime != mtime:
+                    with open(self.path, 'r', encoding='utf8') as file:
+                        loaded = yaml.safe_load(file)
+                    self._data = loaded if loaded is not None else self.empty_factory()
+                    self._cached_mtime = mtime
+
+        return self._data
+
+    def get_data(self):
+        return self._load()
+
+
+preprocess_map_cache = HotReloadingYAML('config/pre_process_map.yaml', empty_factory=list)
+voice_map_cache = HotReloadingYAML('config/voice_to_speaker.yaml', empty_factory=dict)
 
 def unload_model():
     import torch, gc
@@ -125,11 +165,9 @@ def default_exists(filename: str):
 # Read pre process map on demand so it can be changed without restarting the server
 def preprocess(raw_input):
     #logger.debug(f"preprocess: before: {[raw_input]}")
-    default_exists('config/pre_process_map.yaml')
-    with open('config/pre_process_map.yaml', 'r', encoding='utf8') as file:
-        pre_process_map = yaml.safe_load(file)
-        for a, b in pre_process_map:
-            raw_input = re.sub(a, b, raw_input)
+    pre_process_map = preprocess_map_cache.get_data()
+    for a, b in pre_process_map:
+        raw_input = re.sub(a, b, raw_input)
     
     raw_input = raw_input.strip()
     #logger.debug(f"preprocess: after: {[raw_input]}")
@@ -137,14 +175,12 @@ def preprocess(raw_input):
 
 # Read voice map on demand so it can be changed without restarting the server
 def map_voice_to_speaker(voice: str, model: str):
-    default_exists('config/voice_to_speaker.yaml')
-    with open('config/voice_to_speaker.yaml', 'r', encoding='utf8') as file:
-        voice_map = yaml.safe_load(file)
-        try:
-            return voice_map[model][voice]
+    voice_map = voice_map_cache.get_data()
+    try:
+        return copy.deepcopy(voice_map[model][voice])
 
-        except KeyError as e:
-            raise BadRequestError(f"Error loading voice: {voice}, KeyError: {e}", param='voice')
+    except KeyError as e:
+        raise BadRequestError(f"Error loading voice: {voice}, KeyError: {e}", param='voice')
 
 class GenerateSpeechRequest(BaseModel):
     model: str = "tts-1" # or "tts-1-hd"
